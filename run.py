@@ -1,0 +1,295 @@
+from cv2 import cv2
+import numpy as np
+from matplotlib import pyplot as plt
+import os
+import multiprocessing as mp
+from Net import Net
+import torch
+from cv2 import cv2
+from torchvision import transforms
+import math
+
+
+# 霍夫线变换
+def lines_detector_hough(edge, ThetaDim=None, DistStep=None, threshold=None, halfThetaWindowSize=2,
+                         halfDistWindowSize=None):
+    '''
+    :param edge: 经过边缘检测得到的二值图
+    :param ThetaDim: hough空间中theta轴的刻度数量(将[0,pi)均分为多少份),反应theta轴的粒度,越大粒度越细
+    :param DistStep: hough空间中dist轴的划分粒度,即dist轴的最小单位长度
+    :param threshold: 投票表决认定存在直线的起始阈值
+    :return: 返回检测出的所有直线的参数(theta,dist)
+    @author: believas
+    '''
+    imgsize = edge.shape
+    if ThetaDim == None:
+        ThetaDim = 90
+    if DistStep == None:
+        DistStep = 1
+    MaxDist = np.sqrt(imgsize[0] ** 2 + imgsize[1] ** 2)
+    DistDim = int(np.ceil(MaxDist / DistStep))
+
+    if halfDistWindowSize == None:
+        halfDistWindowSize = int(DistDim / 50)
+    accumulator = np.zeros((ThetaDim, DistDim))  # theta的范围是[0,pi). 在这里将[0,pi)进行了线性映射.类似的,也对Dist轴进行了线性映射
+
+    sinTheta = [np.sin(t * np.pi / ThetaDim) for t in range(ThetaDim)]
+    cosTheta = [np.cos(t * np.pi / ThetaDim) for t in range(ThetaDim)]
+
+    for i in range(imgsize[0]):
+        for j in range(imgsize[1]):
+            if not edge[i, j] == 0:
+                for k in range(ThetaDim):
+                    accumulator[k][int(round((i * cosTheta[k] + j * sinTheta[k]) * DistDim / MaxDist))] += 1
+
+    M = accumulator.max()
+
+    if threshold == None:
+        threshold = int(M * 2.3875 / 4.5)
+    result = np.array(np.where(accumulator > threshold))  # 阈值化
+    temp = [[], []]
+    for i in range(result.shape[1]):
+        eight_neiborhood = accumulator[
+                           max(0, result[0, i] - halfThetaWindowSize + 1):min(result[0, i] + halfThetaWindowSize,
+                                                                              accumulator.shape[0]),
+                           max(0, result[1, i] - halfDistWindowSize + 1):min(result[1, i] + halfDistWindowSize,
+                                                                             accumulator.shape[1])]
+        if (accumulator[result[0, i], result[1, i]] >= eight_neiborhood).all():
+            temp[0].append(result[0, i])
+            temp[1].append(result[1, i])
+
+    result = np.array(temp)  # 非极大值抑制
+
+    result = result.astype(np.float64)
+    result[0] = result[0] * np.pi / ThetaDim
+    result[1] = result[1] * MaxDist / DistDim
+    draw = drawLines(result, edge)
+    # plt.imshow(draw)
+    # plt.show()
+
+    return result
+
+# 绘制霍夫线
+def drawLines(lines, edge, color=(255, 0, 0), err=3):
+    if len(edge.shape) == 2:
+        result = np.dstack((edge, edge, edge))
+    else:
+        result = edge
+    Cos = np.cos(lines[0])
+    Sin = np.sin(lines[0])
+
+    for i in range(edge.shape[0]):
+        for j in range(edge.shape[1]):
+            e = np.abs(lines[1] - i * Cos - j * Sin)
+            if (e < err).any():
+                result[i, j] = color
+
+    return result
+
+#  旋转纠正
+def rotate_transfer(src, output_image):
+    # src一定是边缘二值图
+    hough_lines = lines_detector_hough(src)
+    lines = []
+    saves = []
+    if hough_lines.shape[1] <= 1:
+        return output_image
+    else:
+        for i in range(hough_lines.shape[1]):
+            if hough_lines[0][i] < 0.56 * np.pi and hough_lines[0][i] > 0.44 * np.pi:
+                saves.append(hough_lines[0][i])
+        M = cv2.getRotationMatrix2D((600, 400), 90 - np.mean(saves) * 180 / np.pi, 0.98)
+        # print('ratate:', 90 - np.mean(saves) * 180 / np.pi)
+        dst = cv2.warpAffine(output_image, M, (600, 400), cv2.BORDER_CONSTANT, borderValue=255)
+    return dst
+
+
+# 水平投影
+def getHProjection(src):
+    image = src.copy()
+    (h, w) = image.shape  # 返回高和宽
+    # 初始化一个跟图像高一样长度的数组，用于记录每一行的黑点个数
+    a = [0 for z in range(0, h)]
+    for j in range(0, h):  # 遍历每一行
+        for i in range(0, w):  # 遍历每一列
+            if image[j, i] == 0:  # 判断该点是否为黑点，0代表黑点
+                a[j] += 1  # 该行的计数器加一
+                image[j, i] = 255  # 将其改为白点，即等于255
+    for j in range(0, h):  # 遍历每一行
+        for i in range(0, a[j]):  # 从该行应该变黑的最左边的点开始向最右边的点设置黑点
+            image[j, i] = 0  # 设置黑点
+
+
+    dst = image[:, :-110]
+    # plt.imshow(image, cmap=plt.gray())
+    # plt.show()
+    etval, labels, stats, centroids = cv2.connectedComponentsWithStats(dst, connectivity=8)
+    return dst, stats
+
+# 寻找切割的那条线
+def find_baseline(array):
+    list_a = array[:, 4].tolist()
+    del (list_a[0])
+    max_list = max(list_a)  # 返回最大值
+    max_index = list_a.index(max(list_a))  # 最大值的索引
+    shrot_distance = 1000
+    for i in range(1, array.shape[0]):
+        if array[i][1] < array[max_index + 1][1] and array[max_index + 1][1] - array[i][1] < shrot_distance:
+            shrot_distance = array[max_index + 1][1] - array[i][1]
+            index = i
+    return index
+
+
+#计算准确率
+def countacc(image_path, list_):
+    # print(list_)
+    sum_ = 0
+
+    a = os.path.basename(image_path)
+    img_name_list = list(a)
+    img_name_list = img_name_list[4:-4]
+
+    for _ in img_name_list:
+        if _ is '-' or _ is ' ':
+            img_name_list.remove(_)
+    # print('aa', img_name_list)
+
+    new_list = []
+    #10表示N，11表示X
+    for index, _ in enumerate(list_):
+        if index == 0 and _ == 10:
+            pass
+            # list_.remove(10)
+        elif _ == 11:
+            new_list.append('X')
+        else:
+            new_list.append(str(_))
+
+    if len(new_list) != len(img_name_list):
+        return sum_, img_name_list
+    else:
+        for i in range(len(new_list)):
+            if img_name_list[i] == new_list[i]:
+                # print(new_list[i])
+                if i == len(new_list) - 1:
+                    sum_ = 1
+                    return sum_, img_name_list
+                else:
+                    pass
+            else:
+                return sum_, img_name_list
+    return sum_, img_name_list
+
+
+
+def process(source_path, target_path):
+    try:
+        params_path = "save_model/para_version_2.pth"
+        net_path = "save_model/net_version_2.pth"
+        data_transform = transforms.Compose(
+            [transforms.ToTensor(),
+             transforms.Normalize(mean=[0.5, ], std=[0.5, ])])
+
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+        net = torch.load(net_path).to(device)
+        net.load_state_dict(torch.load(params_path))
+        net.eval()
+
+        source_image = cv2.imread(source_path)
+        source_img = cv2.resize(source_image, (600, 400))
+
+        # cv2.imshow('source', source_img)
+
+        filter_image = cv2.GaussianBlur(source_img, (7, 7), 0)
+        gray_image = cv2.cvtColor(filter_image, cv2.COLOR_BGR2GRAY)
+
+        # cv2.imshow('gray', gray_image)
+
+        adaptive_image = cv2.adaptiveThreshold(gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 13, 6)
+        adaptive_image_ = cv2.morphologyEx(adaptive_image, cv2.MORPH_CLOSE, (3, 3))
+
+        # cv2.imshow('adaptive', adaptive_image_)
+
+        edge_image = cv2.Canny(gray_image, 50, 150)
+
+        # cv2.imshow('edge', edge_image)
+
+        rotate_image = rotate_transfer(edge_image, adaptive_image_)
+        rotate_image_inv = cv2.bitwise_not(rotate_image)
+
+        # cv2.imshow('rotate', rotate_image_inv)
+
+        Hprojection_image, stats_projection = getHProjection(rotate_image_inv)
+
+        # cv2.imshow('projection', Hprojection_image)
+
+        index = find_baseline(stats_projection)
+
+        ROI = rotate_image_inv[stats_projection[index][1] - 5:stats_projection[index][1] + stats_projection[index][3] + 7,:]
+
+        kernel = np.ones((2, 2), np.uint8)
+        ROI_dilate = cv2.morphologyEx(ROI, cv2.MORPH_DILATE, kernel, iterations=1)
+        # cv2.imshow('hist_V', ROI_dilate)
+        # print('aera:', stats_projection[index][4])
+        retval, labels, stats, centroids = cv2.connectedComponentsWithStats(ROI_dilate, connectivity=4)
+        list_stats = []
+
+        for index in range(1, stats.shape[0]):
+            if stats[index][3] > 15 and stats[index][3] < stats[0][3] - 2:
+                list_stats.append(stats[index])
+
+        stats_ = np.array(list_stats)
+        stats_index = np.argsort(stats_[:, 0])
+
+        aa = stats_index[4:]
+        list = []
+        for index in stats_index[4:]:
+            digital = ROI_dilate[stats_[index][1]:stats_[index][1] + stats_[index][3],
+                      stats_[index][0]:stats_[index][0] + stats_[index][2]]
+            digital = cv2.morphologyEx(digital, cv2.MORPH_ERODE, kernel, iterations=1)
+            digital = cv2.resize(digital, (28, 28))
+            # list.append(digital)
+
+            digital = data_transform(digital)
+            out = net(digital)
+            arg_max = torch.argmax(out, 1)
+            result = arg_max.numpy().tolist()
+            list.append(result[0])
+        acc, img_name = countacc(source_path, list)
+        print(img_name, '\t\t', list,'\t\t',acc)
+
+        return acc
+    
+    #处理一些处理处理不了的，直接放弃
+    except:
+        print(target_path)
+        return 0
+
+
+if __name__ == '__main__':
+    path = 'data_test/'
+    img_paths = os.listdir(path)
+    result = 0
+    i_ = 0
+    sum_ = []
+    
+    # 多进程运算， processes的数值最大为cpu的最大进程数量
+    pool = mp.Pool(processes=3)
+    for img in img_paths:
+        i_ += 1
+        abs_path = os.path.join(path, img)
+        img_name = img.split('.')[0]
+        sum_.append(pool.apply_async(process, (abs_path, img_name)))
+    pool.close()
+    pool.join()
+
+
+    # 计算完全匹配的准确率
+    for _ in sum_:
+        result += _.get()
+        print(_.get())
+    print('Overall accuracy:',result / 100)
+
